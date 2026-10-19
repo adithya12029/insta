@@ -1,0 +1,724 @@
+import os
+from pathlib import Path
+from PIL import Image, ImageOps
+from config import BACKGROUNDS_DIR, CARD_WIDTH, CARD_HEIGHT, COLOR_FALLBACK
+
+class AssetManager:
+    """Indexes and crops background images for the inner card container."""
+
+    def __init__(self, backgrounds_dir: Path = BACKGROUNDS_DIR):
+        self.backgrounds_dir = backgrounds_dir
+        self.supported_extensions = {".png", ".jpg", ".jpeg", ".webp"}
+
+    def get_available_backgrounds(self) -> list[str]:
+        """Returns sorted list of background filenames inside assets/backgrounds/."""
+        if not self.backgrounds_dir.exists():
+            return []
+        
+        files = []
+        for file in self.backgrounds_dir.iterdir():
+            if file.is_file() and file.suffix.lower() in self.supported_extensions:
+                files.append(file.name)
+        return sorted(files)
+
+    def load_background_image(self, bg_filename: str | None = None) -> Image.Image:
+        """Loads and crops a background image to fit the inner card dimensions."""
+        if bg_filename:
+            bg_path = self.backgrounds_dir / bg_filename
+            if bg_path.exists():
+                img = Image.open(bg_path).convert("RGBA")
+                return ImageOps.fit(img, (CARD_WIDTH, CARD_HEIGHT), centering=(0.5, 0.5))
+        
+        # Fallback solid color block if image doesn't exist or is not specified
+        return Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), COLOR_FALLBACK)import os
+import re
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+
+from config import (
+    CANVAS_WIDTH,
+    CANVAS_HEIGHT,
+    PADDING,
+    CORNER_RADIUS,
+    CARD_WIDTH,
+    CARD_HEIGHT,
+    VIGNETTE_INSET,
+    VIGNETTE_BLUR_RADIUS,
+    GRAIN_INTENSITY,
+    COLOR_BG,
+    COLOR_FALLBACK,
+    BRAND_HANDLE,
+    FONT_REGULAR_PATH,
+    FONT_BOLD_PATH,
+    FONT_ITALIC_PATH
+)
+
+# Text and decoration color constant
+COLOR_TEXT = "#FFFFFF"
+
+
+class Compositor:
+    """Pillow rendering engine with fixed white text styling on all background images."""
+
+    def __init__(self):
+        self.fonts = self._load_fonts()
+
+    def _apply_film_grain(self, image: Image.Image, intensity: int = GRAIN_INTENSITY) -> Image.Image:
+        """Generates fine black stipple noise and overlays it on the canvas."""
+        if intensity <= 0:
+            return image
+
+        w, h = image.size
+        noise_bytes = os.urandom(w * h)
+        noise_l = Image.frombytes("L", (w, h), noise_bytes)
+
+        max_alpha = int(255 * (intensity / 100.0))
+        alpha_channel = noise_l.point(lambda opacity: int((opacity / 255.0) * max_alpha))
+
+        black_layer = Image.new("RGBA", (w, h), (0, 0, 0, 255))
+        black_layer.putalpha(alpha_channel)
+
+        return Image.alpha_composite(image.convert("RGBA"), black_layer)
+
+    def _load_fonts(self) -> dict[str, ImageFont.ImageFont]:
+        """Loads Georgia fonts with fallback support."""
+        font_map = {}
+        size_configs = {
+            "cover": (FONT_BOLD_PATH, 68),
+            "open": (FONT_REGULAR_PATH, 54),
+            "mcq_q": (FONT_REGULAR_PATH, 48),
+            "mcq_opt": (FONT_REGULAR_PATH, 44),
+            "handle": (FONT_REGULAR_PATH, 28)
+        }
+
+        for key, (font_path, size) in size_configs.items():
+            try:
+                if font_path.exists():
+                    font_map[key] = ImageFont.truetype(str(font_path), size)
+                else:
+                    font_map[key] = ImageFont.load_default()
+            except Exception:
+                font_map[key] = ImageFont.load_default()
+
+        return font_map
+
+    def wrap_text(self, text: str, font: ImageFont.ImageFont, max_width: int, draw: ImageDraw.ImageDraw = None) -> list[str]:
+        """Word-wraps text to fit inside specified pixel width bounds."""
+        clean_text = text.replace("_", "")
+
+        if draw is None:
+            dummy_img = Image.new("RGB", (1, 1))
+            draw = ImageDraw.Draw(dummy_img)
+
+        words = clean_text.split()
+        lines = []
+        current_line = []
+
+        for word in words:
+            test_line = ' '.join(current_line + [word])
+            bbox = draw.textbbox((0, 0), test_line, font=font)
+            width = bbox[2] - bbox[0]
+
+            if width <= max_width:
+                current_line.append(word)
+            else:
+                if current_line:
+                    lines.append(' '.join(current_line))
+                current_line = [word]
+
+        if current_line:
+            lines.append(' '.join(current_line))
+
+        return lines
+
+    def _build_card_base(self, bg_image: Image.Image | None = None) -> Image.Image:
+        """Creates rounded card with an inner shadow vignette hugging the border curve."""
+        if bg_image:
+            img = bg_image.convert("RGBA")
+            if img.size != (CARD_WIDTH, CARD_HEIGHT):
+                img = ImageOps.fit(img, (CARD_WIDTH, CARD_HEIGHT), centering=(0.5, 0.5))
+        else:
+            img = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), COLOR_FALLBACK)
+
+        # 1. Build Inner Shadow Alpha Mask
+        shadow_mask = Image.new("L", (CARD_WIDTH, CARD_HEIGHT), 255)
+        s_draw = ImageDraw.Draw(shadow_mask)
+
+        inner_radius = max(1, CORNER_RADIUS - VIGNETTE_INSET)
+        s_draw.rounded_rectangle(
+            [VIGNETTE_INSET, VIGNETTE_INSET, CARD_WIDTH - VIGNETTE_INSET, CARD_HEIGHT - VIGNETTE_INSET],
+            radius=inner_radius,
+            fill=0
+        )
+
+        # 2. Softly blur mask inward across edge
+        shadow_mask = shadow_mask.filter(ImageFilter.GaussianBlur(VIGNETTE_BLUR_RADIUS))
+
+        black_vignette = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 255))
+        black_vignette.putalpha(shadow_mask)
+
+        card = Image.alpha_composite(img, black_vignette)
+
+        # 3. Apply Rounded Corner Clipping Mask
+        corner_mask = Image.new("L", (CARD_WIDTH, CARD_HEIGHT), 0)
+        c_draw = ImageDraw.Draw(corner_mask)
+        c_draw.rounded_rectangle([0, 0, CARD_WIDTH, CARD_HEIGHT], radius=CORNER_RADIUS, fill=255)
+
+        card.putalpha(corner_mask)
+        return card
+
+    def _draw_brand_handle(self, draw: ImageDraw.ImageDraw):
+        """Renders brand handle centered near bottom Y = 81% in pure white."""
+        handle = BRAND_HANDLE if BRAND_HANDLE.startswith("@") else f"@{BRAND_HANDLE}"
+        font = self.fonts["handle"]
+        bbox = draw.textbbox((0, 0), handle, font=font)
+        text_w = bbox[2] - bbox[0]
+
+        x = (CANVAS_WIDTH - text_w) / 2
+        y = CANVAS_HEIGHT * 0.81
+        draw.text((x, y), handle, font=font, fill=COLOR_TEXT)
+
+    def render_slide(self, slide_data: dict, bg_image: Image.Image | None = None) -> Image.Image:
+        """Renders card background, text layer in white, and applies film grain."""
+        canvas = Image.new("RGBA", (CANVAS_WIDTH, CANVAS_HEIGHT), COLOR_BG)
+        card = self._build_card_base(bg_image)
+        canvas.paste(card, (PADDING, PADDING), card)
+
+        draw = ImageDraw.Draw(canvas)
+
+        slide_type = slide_data.get("type", "cover")
+        if slide_type == "cover":
+            self._render_cover_slide(draw, slide_data)
+        elif slide_type == "open":
+            self._render_open_slide(draw, slide_data)
+        elif slide_type in ("mcq", "mcq_question"):
+            self._render_mcq_slide(draw, slide_data)
+
+        self._draw_brand_handle(draw)
+        canvas = self._apply_film_grain(canvas, intensity=GRAIN_INTENSITY)
+        return canvas
+
+    def _render_cover_slide(self, draw: ImageDraw.ImageDraw, data: dict):
+        """Card Cover Layout: Centered bold text in pure white (no underlines)."""
+        title_text = data.get("title", "")
+        max_text_width = CARD_WIDTH - 160
+        font = self.fonts["cover"]
+
+        # Strip any underscores from the input string
+        clean_text = title_text.replace("_", "")
+        lines = self.wrap_text(clean_text, font, max_text_width, draw)
+
+        # Calculate total height for vertical centering
+        line_heights = []
+        total_height = 0
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            h = bbox[3] - bbox[1]
+            line_heights.append(h)
+            total_height += h * 1.35
+
+        start_y = PADDING + (CARD_HEIGHT / 2) - (total_height / 2) - 20
+
+        # Render centered lines of text
+        for i, line in enumerate(lines):
+            bbox = draw.textbbox((0, 0), line, font=font)
+            line_w = bbox[2] - bbox[0]
+            line_x = PADDING + (CARD_WIDTH / 2) - (line_w / 2)
+
+            draw.text((line_x, start_y), line, font=font, fill=COLOR_TEXT)
+
+            start_y += line_heights[i] * 1.35
+
+    def _render_open_slide(self, draw: ImageDraw.ImageDraw, data: dict):
+        """Open Question Layout: Left-aligned question centered vertically in pure white."""
+        question = data.get("question", data.get("title", ""))
+        max_text_width = CARD_WIDTH - 200
+        font = self.fonts["open"]
+        left_margin = PADDING + 90
+
+        clean_text = question.replace("_", "")
+        lines = self.wrap_text(clean_text, font, max_text_width, draw)
+
+        line_heights = []
+        total_height = 0
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            h = bbox[3] - bbox[1]
+            line_heights.append(h)
+            total_height += h * 1.35
+
+        start_y = PADDING + (CARD_HEIGHT / 2) - (total_height / 2) - 20
+
+        for i, line in enumerate(lines):
+            draw.text((left_margin, start_y), line, font=font, fill=COLOR_TEXT)
+            start_y += line_heights[i] * 1.35
+
+    def _render_mcq_slide(self, draw: ImageDraw.ImageDraw, data: dict):
+        """MCQ Slide Layout: Left-aligned question header with choices in pure white."""
+        question = data.get("question", "")
+        options = data.get("options", [])
+
+        max_text_width = CARD_WIDTH - 200
+        left_margin = PADDING + 90
+
+        font_q = self.fonts["mcq_q"]
+        font_o = self.fonts["mcq_opt"]
+
+        # 1. Wrap question
+        q_lines = self.wrap_text(question, font_q, max_text_width, draw)
+
+        start_y = PADDING + 320
+        current_y = start_y
+
+        # 2. Draw Question
+        for line in q_lines:
+            bbox = draw.textbbox((0, 0), line, font=font_q)
+            h = bbox[3] - bbox[1]
+            draw.text((left_margin, current_y), line, font=font_q, fill=COLOR_TEXT)
+            current_y += h * 1.15
+
+        current_y += 28
+
+        # 3. Draw Options with ")" prefix
+        for idx, option in enumerate(options):
+            if re.match(r'^[A-Z]\)', option):
+                opt_text = option
+            else:
+                prefix = f"{chr(65+idx)})"
+                opt_text = f"{prefix} {option}"
+
+            o_lines = self.wrap_text(opt_text, font_o, max_text_width, draw)
+            for line in o_lines:
+                bbox = draw.textbbox((0, 0), line, font=font_o)
+                h = bbox[3] - bbox[1]
+                draw.text((left_margin, current_y), line, font=font_o, fill=COLOR_TEXT)
+                current_y += h * 1.15
+
+            current_y += 8
+            # Email / app
+MAIL_SENDER_EMAIL=adithyabhat2806@gmail.com
+MAIL_APP_PASSWORD=tthzvrwadhnovaht
+MAIL_RECIPIENT_EMAIL=adithyabhat2806@gmail.com
+MAIL_SMTP_HOST=smtp.gmail.com
+MAIL_SMTP_PORT=587
+PUBLIC_BASE_URL=http://127.0.0.1:5000
+TARGET_FOLDER=C:\Users\adith\OneDrive\Documents\final\carousels\batch_20260913_164155
+
+# Cloudinary
+CLOUDINARY_CLOUD_NAME=dghxfk6bl
+CLOUDINARY_API_KEY=446318486253358
+CLOUDINARY_API_SECRET=Y6wxEgXNh0XCTqYvr7nlFYv4l0U
+
+# Instagram / Meta
+INSTAGRAM_ACCOUNT_ID=17841422688822220
+INSTAGRAM_ACCESS_TOKEN=EAAUUKc5jrjgBSWF5e88noyS75mZCjnlImVzLYuBDXPSVt7VaohUZCPAZBFFnxTUZA8HhaaM8dpZAqdd7ZB9YOZBkwaO51ZCZCHbvPdsf6EkgRLFfGsBTUM30lODefbtop81cdHXT5B70Ijq0lFb8ZClHnsOxCnqp4ZAoafVAumRLZCuzfex2Byuqpl0pACOdjIP7O1ZAo2zWo8is9ZB0ZCBHD01wwskcExasoIMLZCwsOl2CtfYPvep6ZAZAIBalyyaVSViQiBDbC09uyXU94TpNnCuAcZD
+INSTAGRAM_PAGE_ID=1332952466561236
+
+# Project defaults
+POST_TARGET_FOLDER=C:\Users\adith\OneDrive\Documents\final\carousels\batch_20260913_164155\post_02_toxic_taste_radar
+APPROVED_ARCHIVE_DIR=C:\Users\adith\OneDrive\Documents\final\carousels\approved
+GEMINI_API_KEY=AQ.Ab8RN6LMIR_s1tZ7DZCCYYCDGxyb22UpfgYajDE7NelOn-D9aw"""
+Job configuration for the carousel generator.
+
+Each entry in JOBS describes one generation job:
+- label: a short name used in the output folder name
+- mode: force a specific key from PROMPT_MODES (see src/prompt_modes.py),
+        or None to pick a random mode for each post in this job
+- audience: "for_her", "for_bf", or None to pick randomly per post
+- slide_type: "mcq", "open", or None to pick randomly per post
+- batches: how many separate carousel posts to generate for this job
+- questions: how many question slides per post in this job
+
+Edit this list freely — add, remove, or change numbers per run.
+"""
+
+JOBS = [
+    {
+        "label": "fun_action",
+        "mode": "couple_challenge",
+        "audience": "for_bf",
+        "slide_type": None,
+        "batches": 0,
+        "questions": 0,
+    },
+    {
+        "label": "about_him",
+        "mode": None,
+        "audience": "for_bf",
+        "slide_type": None,
+        "batches": 0,
+        "questions": 0,
+    },
+    {
+        "label": "about_her",
+        "mode": None,
+        "audience": "for_her",
+        "slide_type": None,
+        "batches": 2,
+        "questions": 5
+        ,
+    },
+]import json
+import random
+from google import genai
+from google.genai import types
+from config import GEMINI_API_KEY, LLM_MODEL
+from src.prompt_modes import PROMPT_MODES
+from src.Prompt_templates import build_post_prompt
+
+
+class LLMGenerator:
+    """Generates structured JSON payloads via Google Gemini API."""
+
+    def __init__(self):
+        if not GEMINI_API_KEY:
+            self.client = None
+        else:
+            self.client = genai.Client(api_key=GEMINI_API_KEY)
+
+        self.prompt_modes = PROMPT_MODES
+
+    def generate_post_payload(
+        self,
+        topics: list[str],
+        available_bgs: list[str],
+        question_count: int,
+        forced_mode_key: str | None = None,
+        forced_audience: str | None = None,
+        forced_slide_type: str | None = None,
+    ) -> dict:
+        if not self.client:
+            raise ValueError("GEMINI_API_KEY is missing from .env configuration.")
+
+        bgs_list = available_bgs if available_bgs else ["paper_dark.png"]
+
+        # 1. Slide type: forced value if given, else random
+        slide_type = forced_slide_type or random.choice(["mcq", "open"])
+
+        # 2. Target audience: forced value if given, else random
+        target_audience = forced_audience or random.choice(["for_her", "for_bf"])
+
+        # 3. Prompt mode: forced key if given, else random
+        if forced_mode_key:
+            if forced_mode_key not in self.prompt_modes:
+                raise ValueError(f"Unknown mode key: {forced_mode_key}")
+            mode_key = forced_mode_key
+        else:
+            mode_key = random.choice(list(self.prompt_modes.keys()))
+        selected_mode = self.prompt_modes[mode_key]
+
+        prompt = build_post_prompt(
+            topics=topics,
+            bgs_list=bgs_list,
+            question_count=question_count,
+            slide_type=slide_type,
+            target_audience=target_audience,
+            mode_key=mode_key,
+            selected_mode=selected_mode,
+        )
+
+        response = self.client.models.generate_content(
+            model=LLM_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
+        )
+
+        return json.loads(response.text)"""
+Prompt mode definitions for the carousel generator.
+
+Each mode is a dict with:
+- name: display name
+- description: one-line summary
+- rules: instructions injected into the LLM prompt for this mode
+"""
+
+PROMPT_MODES = {
+    "protected_queen": {
+        "name": "Protected Queen",
+        "description": "Girl is always protected, validated, and positioned as superior",
+        "rules": """
+        - Primary emotional outcome: She finishes feeling validated, slightly superior, and entertained.
+        - Never call her toxic, crazy, dramatic, insecure, or needy.
+        - Never frame her standards as high maintenance.
+        - Always position her as the one with clear standards and sharp intuition.
+        - Tone: Soft shade + girlhood confession energy.
+        """
+    },
+    "soft_toxic": {
+        "name": "Soft Toxic",
+        "description": "Relatable toxic traits with soft self-roast",
+        "rules": """
+        - Primary emotional outcome: She feels seen in her messy side with humor, not shame.
+        - Allowed and encouraged to ask about her own toxic traits, jealousy, silent treatment, testing, double standards.
+        - Tone: "we all do it" energy. Soft self-roast.
+        - Still protect her overall worth.
+        """
+    },
+    "ruthless_mirror": {
+        "name": "Ruthless Mirror",
+        "description": "Direct, slightly confronting self-reflection",
+        "rules": """
+        - Primary emotional outcome: Mild discomfort + curiosity. She feels slightly called out.
+        - Direct self-questioning is preferred.
+        - Highlight her double standards, emotional games, avoidance, or testing behavior.
+        - Tone: Best friend who doesn't sugarcoat. Sharp but not cruel.
+        """
+    },
+    "girlhood_chaos": {
+        "name": "Girlhood Chaos",
+        "description": "Messy, dramatic, unfiltered girl talk",
+        "rules": """
+        - Primary emotional outcome: "omg this is so me" recognition + entertainment.
+        - Lean into emotional chaos, overthinking, mixed signals she gives, silent treatments, delulu moments, revenge thoughts.
+        - Tone: Best-friend group chat energy — chaotic, funny, slightly unhinged.
+        """
+    },
+    "high_value_gatekeeper": {
+        "name": "High Value Gatekeeper",
+        "description": "Cold, selective, elite standards",
+        "rules": """
+        - Primary emotional outcome: She feels elite and selective.
+        - Extremely high standards are celebrated.
+        - Self-questioning is rare. Focus on his failures and her non-negotiables.
+        - Tone: Slightly cold, detached, "I don't chase, I replace".
+        """
+    },
+    "delulu_romantic": {
+        "name": "Delulu Romantic",
+        "description": "Hopeful, romanticizing, ignoring red flags",
+        "rules": """
+        - Primary emotional outcome: Soft, dreamy, slightly delusional hope.
+        - She romanticizes situations, ignores red flags, and holds onto potential.
+        - Questions can gently expose her delulu thinking in a loving way.
+        - Tone: Soft, romantic, a little unrealistic and sweet.
+        """
+    },
+    "revenge_era": {
+        "name": "Revenge Era",
+        "description": "Petty, post-breakup, soft villain energy",
+        "rules": """
+        - Primary emotional outcome: Satisfying petty energy and soft power.
+        - Focus on moving on loudly, looking better, emotional detachment as revenge, or subtle shade.
+        - Allowed to be a little mean or calculated.
+        - Tone: Cold smile, "I'm the prize now" energy.
+        """
+    },
+    "overthinker": {
+        "name": "Overthinker",
+        "description": "Anxious, analyzing every text and silence",
+        "rules": """
+        - Primary emotional outcome: Deep relatability for girls who overanalyze everything.
+        - Focus on double-texting anxiety, left-on-read spirals, analyzing tone, replaying conversations.
+        - Self-questioning about her own anxiety and attachment is welcome.
+        - Tone: Soft, slightly anxious, very internal.
+        """
+    },
+    "main_character": {
+        "name": "Main Character",
+        "description": "Dramatic, cinematic, everything is a plot",
+        "rules": """
+        - Primary emotional outcome: She feels like the star of a movie.
+        - Everything is heightened, dramatic, and plot-relevant.
+        - Questions should feel like scenes from a story.
+        - Tone: Cinematic, a little extra, high-stakes emotion.
+        """
+    },
+    "lowkey_mean": {
+        "name": "Lowkey Mean",
+        "description": "Subtle shade, passive-aggressive, quiet judgment",
+        "rules": """
+        - Primary emotional outcome: Guilty pleasure + soft superiority.
+        - Allow subtle judgment, quiet shade, and passive-aggressive energy.
+        - She can be a little mean or judgmental toward him or other girls.
+        - Tone: Polite on the surface, sharp underneath.
+        """
+    },
+    "healing_but_messy": {
+        "name": "Healing But Messy",
+        "description": "Trying to heal while still being toxic sometimes",
+        "rules": """
+        - Primary emotional outcome: Relatable "I'm working on myself but not perfect" feeling.
+        - She is aware of her patterns but still slips into old behaviors.
+        - Self-questioning about progress vs old habits is perfect.
+        - Tone: Honest, slightly tired, self-aware but not fully healed.
+        """
+    },
+    "cold_detached": {
+        "name": "Cold Detached",
+        "description": "Emotionally unavailable, soft avoidant energy",
+        "rules": """
+        - Primary emotional outcome: Cool, distant, hard-to-reach energy.
+        - She keeps people at arm's length, doesn't chase, and protects her peace almost too much.
+        - Questions can explore her emotional walls and selective availability.
+        - Tone: Calm, distant, slightly untouchable.
+        """
+    },
+    "traditional_soft": {
+        "name": "Traditional Soft",
+        "description": "Feminine, classic standards, soft traditional energy",
+        "rules": """
+        - Primary emotional outcome: Soft feminine power and classic standards.
+        - Values like effort, provision, consistency, and masculine leadership are celebrated.
+        - Self-questioning is minimal. Focus stays on what she deserves.
+        - Tone: Soft, elegant, quietly firm.
+        """
+    },
+    "couple_challenge": {
+        "name": "Couple Challenge",
+        "description": "A shared mini-task or question both partners do together, then compare answers",
+        "rules": """
+        - Primary emotional outcome: Shared laughter, curiosity, "let's find out together" energy.
+        - Frame every prompt as something BOTH partners do or answer, then compare notes.
+        - Good formats: "Ask him this, then answer it yourself before he replies" /
+          "Both guess the other's answer, see who's right" /
+          "Send this and react to his answer together"
+        - Never frame it as catching him out, testing loyalty, or exposing a flaw.
+        - The fun is in the reveal/comparison, not in judging the response.
+        - Tone: Playful, warm, like a couple's game night dare — not an interrogation.
+        """
+    },
+}"""
+Prompt template construction for the carousel generator.
+
+Keeping this separate from llm_generator.py means prompt wording can be
+tuned/tested without touching the API call or JSON parsing logic.
+"""
+
+import json
+
+# Extra structural instructions for modes that need a different slide shape
+# than a plain question. Keyed by mode_key; appended to the base prompt
+# when that mode is selected.
+MODE_SPECIFIC_INSTRUCTIONS = {
+    "couple_challenge": """
+        ADDITIONAL RULES FOR THIS MODE (couple_challenge):
+        - Each slide should pose a mini-challenge or question for the couple to do together.
+        - Include a short action cue in the question text (e.g. "Ask him now" or
+          "Both write your answer before reading his").
+        - Keep it under 10 words, same length limit as other modes.
+        - The follow-up should invite comparing answers together, not scoring
+          or judging one partner. Do not frame it as a test or a trap.
+        """
+}
+
+
+def build_post_prompt(
+    topics: list[str],
+    bgs_list: list[str],
+    question_count: int,
+    slide_type: str,
+    target_audience: str,
+    mode_key: str,
+    selected_mode: dict,
+) -> str:
+    """Builds the full Gemini prompt string for one carousel post."""
+
+    pattern_desc = f"All slides must be of type: '{slide_type}'"
+    mode_rules = selected_mode["rules"]
+    mode_extra = MODE_SPECIFIC_INSTRUCTIONS.get(mode_key, "")
+
+    if target_audience == "for_her":
+        audience_instructions = """
+        - TARGET AUDIENCE: FOR HER, about HER OWN feelings, choices, or behavior. Locked for every slide.
+        - Every single question, with no exceptions, must be phrased as "you" meaning HER —
+          asking what SHE thinks, feels, does, or notices about herself.
+        - Do NOT phrase any question as something to say/send/ask to him. Do NOT phrase any
+          question as being about his feelings, his actions, or his perspective as the subject.
+        - If a question is about a shared moment (a glance, a habit), it must ask how SHE
+          experiences or interprets it — not what it means for him or as a joint activity.
+        """
+    else:
+        audience_instructions = """
+        - TARGET AUDIENCE: A shared prompt for HER to do together WITH her partner. Locked for every slide.
+        - Every single question, with no exceptions, must be something she does or asks together
+          with him — not a private reflection about her own feelings in isolation.
+        - Do NOT phrase any question as purely introspective ("how do you feel about...").
+          Frame it as an action or exchange between the two of them.
+        """
+
+    consistency_instructions = """
+    - CONSISTENCY (CRITICAL): The cover title and every question must come from the SAME
+      synthesized idea. The cover sets a specific promise or angle — every slide underneath it
+      must directly explore that exact angle, not drift into a related-but-different topic.
+    - Do not mix perspectives across slides. If the audience is "for_her", every slide reads as
+      her own reflection. If "for_bf", every slide reads as a joint action with him. Never blend
+      the two within the same post.
+    """
+
+    prompt = f"""
+    You are the lead content strategist for an Instagram carousel brand called "unmasked.thoughts".
+    Your niche blends relatable relationship truths with girlhood gossip, aesthetic lifestyle vibes,
+    fashion, and beauty.
+
+    CURRENT MODE: {selected_mode['name']}
+    {mode_rules}
+    {mode_extra}
+
+    Your task is to create a seamless Instagram carousel by synthesizing the following randomly
+    selected topics into ONE unified theme and punchy questions.
+
+    Topics to blend: {json.dumps(topics)}
+    Available background image files: {json.dumps(bgs_list)}
+    Number of question slides to generate: {question_count}
+
+    {audience_instructions}
+    {consistency_instructions}
+
+    CONTENT GENERATION RULES (CRITICAL):
+    1. THE SYNTHESIS: Find the underlying emotional bridge between the topics. Keep everything simple and direct.
+    2. COVER SLIDE:
+        - Must be short and snappy (under 7 words).
+        - Include underscores around ONE key word (example: "Does he _actually_ care? 🥀").
+        - End with exactly ONE emoji.
+    3. QUESTIONS (VERY IMPORTANT):
+        - Keep every question extremely short and simple.
+        - Maximum 8-10 words per question.
+        - No complex or long sentences.
+        - Direct and easy to understand.
+    4. MCQ OPTIONS (STRICT RULE):
+        - Format: "A) [Text]", "B) [Text]", "C) [Text]", "D) [Text]"
+        - Each option must be maximum 2 tokens only.
+        - Never write long options.
+    5. OPEN QUESTIONS:
+        - Must have an empty options array [].
+    6. Select EXACTLY ONE background from the list.
+    7. Generate exactly {question_count} question slides of type: {slide_type}
+
+    Return ONLY a JSON object matching this schema:
+    {{
+      "selected_background": "filename.png",
+      "topic_slug": "short_topic_identifier",
+      "mode_used": "{mode_key}",
+      "target_audience": "{target_audience}",
+      "cover": {{
+        "title": "string"
+      }},
+      "slides": [
+        {{
+          "type": "mcq" | "open",
+          "question": "string",
+          "options": ["string"]
+        }}
+      ]
+    }}
+    """
+    return promptfrom collections.abc import Callable, Iterable
+from typing import Any, TypeVar, overload
+
+_T = TypeVar("_T")
+_S = TypeVar("_S")
+
+__license__: str
+__title__: str
+
+@overload
+def first(iterable: Iterable[_T]) -> _T | None: ...
+@overload
+def first(iterable: Iterable[_T], default: _S) -> _T | _S: ...
+@overload
+def first(iterable: Iterable[_T], default: _S, key: Callable[[_T], Any] | None) -> _T | _S: ...
+@overload
+def first(iterable: Iterable[_T], default: None, key: Callable[[_T], Any] | None) -> _T | None: ...
+@overload
+def first(iterable: Iterable[_T], *, key: Callable[[_T], Any] | None) -> _T | None: ...
